@@ -20,7 +20,8 @@ use trust_dns_client::rr::record_data::RData;
 use trust_dns_client::rr::record_type::RecordType;
 use trust_dns_client::udp::UdpClientConnection;
 
-const NS1_GOOGLE_COM_IP_ADDR: &'static str = "216.239.32.10:53";
+const NS1_GOOGLE_COM_IP4_ADDR: &'static str = "216.239.32.10:53";
+const NS1_GOOGLE_COM_IP6_ADDR: &'static str = "[2001:4860:4802:32::a]:53";
 
 fn env_var(n: &str) -> String {
     let err = format!("Environment Variable '{}' must be set!", &n);
@@ -62,10 +63,31 @@ fn cloudflare_api(
     Ok(response_json)
 }
 
-fn get_current_ip() -> Result<String, ()> {
-    let gdns_addr = (NS1_GOOGLE_COM_IP_ADDR)
-        .parse()
-        .expect("Couldn't get Google DNS Socket Addr");
+fn get_current_ip4_addr() -> Result<String, ()> {
+    let gdns_addr = (NS1_GOOGLE_COM_IP4_ADDR).parse().expect("Couldn't get Google DNS Socket Addr");
+    let conn = UdpClientConnection::new(gdns_addr).expect("Couldn't open DNS UDP Connection");
+    let client = SyncClient::new(conn);
+
+    let name = domain::Name::new();
+    let name = name.append_label("o-o").unwrap()
+        .append_label("myaddr").unwrap()
+        .append_label("l").unwrap()
+        .append_label("google").unwrap()
+        .append_label("com").unwrap();
+    let response = client.query(&name, DNSClass::IN, RecordType::TXT).unwrap();
+
+    let record = &response.answers()[0];
+    match record.rdata() {
+        &RData::TXT(ref txt) => {
+            let val = txt.txt_data();
+            return Ok(String::from_utf8(val[0].to_vec()).unwrap())
+        },
+        _ => return Err(())
+    }
+}
+
+fn get_current_ip6_addr() -> Result<String, ()> {
+    let gdns_addr = (NS1_GOOGLE_COM_IP6_ADDR).parse().expect("Couldn't get Google DNS Socket Addr");
     let conn = UdpClientConnection::new(gdns_addr).expect("Couldn't open DNS UDP Connection");
     let client = SyncClient::new(conn);
 
@@ -96,10 +118,10 @@ fn get_current_ip() -> Result<String, ()> {
 fn main() {
     pretty_env_logger::init();
 
-    let current_ip = get_current_ip()
-        .ok()
-        .expect("Was unable to determine current IP address.");
-    info!("{}", current_ip);
+    let current_ip4_addr = get_current_ip4_addr().ok().expect("Was unable to determine current IPv4 address.");
+    let current_ip6_addr = get_current_ip6_addr().ok().expect("Was unable to determine current IPv6 address.");
+    info!("{}", current_ip4_addr);
+    info!("{}", current_ip6_addr);
     let client = reqwest::blocking::Client::new();
 
     let cloudflare_records_env = env_var("CLOUDFLARE_RECORDS");
@@ -140,18 +162,23 @@ fn main() {
             let record_name = record.get("name").unwrap().as_str().unwrap();
             let record_content = record.get("content").unwrap().as_str().unwrap();
 
-            if !cloudflare_records.contains(&record_name) || record_type != "A" {
-                continue;
+            if !cloudflare_records.contains(&record_name) || (record_type != "A" && record_type != "AAAA") {
+                continue
             }
 
-            if record_content == current_ip {
+            if record_content == current_ip4_addr || record_content == current_ip6_addr {
                 info!("{} skipped, up to date", record_name);
                 continue;
             }
 
-            print!("{} ({} -> {})... ", record_name, record_content, current_ip);
+            if record_type == "A" {
+                print!("{} ({} -> {})... ", record_name, record_content, current_ip4_addr);
+            } else {
+                print!("{} ({} -> {})... ", record_name, record_content, current_ip6_addr);
+            }
             io::stdout().flush().ok();
 
+            let record_addr = if record_type == "A" { current_ip4_addr.clone() } else { current_ip6_addr.clone() };
             let record_url = format!(
                 "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
                 zone_id, record_id
@@ -159,7 +186,7 @@ fn main() {
             let record_update_body = format!(
                 r#"{{"name": "{}", "content": "{}", "type": "{}", "ttl": 600, "proxied": false}}"#,
                 record_name,
-                current_ip,
+                record_addr,
                 record_type);
             cloudflare_api(&client, &*record_url, Some(record_update_body.to_string())).unwrap();
         }
